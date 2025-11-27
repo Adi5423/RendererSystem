@@ -9,7 +9,6 @@ struct Camera {
     double yaw;      // around Y axis (in radians)
     double pitch;    // around X axis (in radians)
 
-    // View plane config
     double viewPlaneDist;   // distance from camera to view plane (e.g. 1.0)
     double viewPlaneWidth;  // physical width of view plane (e.g. 0.5)
     double viewPlaneHeight; // determined by aspect ratio
@@ -31,10 +30,19 @@ struct Camera {
         , pitch(pitchRadians)
         , viewPlaneDist(planeDist)
         , viewPlaneWidth(planeWidth)
+        , viewPlaneHeight(0.0)
         , imageWidth(imgW)
         , imageHeight(imgH)
     {
-        double aspect = static_cast<double>(imgH) / static_cast<double>(imgW);
+        setImageSize(imgW, imgH);
+    }
+
+    // Update the image size and recompute the view plane height.
+    void setImageSize(int w, int h) {
+        imageWidth = w;
+        imageHeight = h;
+
+        double aspect = static_cast<double>(imageHeight) / static_cast<double>(imageWidth);
         viewPlaneHeight = viewPlaneWidth * aspect;
     }
 
@@ -60,9 +68,9 @@ struct Camera {
         );
     }
 
-    // Generate a ray for pixel (px, py)
+    // Generate a ray for pixel (px, py) in [0, imageWidth/Height)
     Ray generateRay(int px, int py) const {
-        // Convert pixel coords to [-0.5, +0.5] range across the view plane
+        // Convert pixel coords to [0,1] then to [-0.5, +0.5] in view plane
         double u = (static_cast<double>(px) + 0.5) / static_cast<double>(imageWidth);
         double v = (static_cast<double>(py) + 0.5) / static_cast<double>(imageHeight);
 
@@ -73,7 +81,7 @@ struct Camera {
         // Base direction before rotation
         Vec3 dir(x, -y, z); // -y so that top of image is positive up
 
-        // Apply yaw then pitch (same as explanation: rot_y then rot_x)
+        // Apply yaw then pitch
         dir = rotateY(dir, yaw);
         dir = rotateX(dir, pitch);
 

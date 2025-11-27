@@ -15,7 +15,7 @@ elseif (MSVC)
 endif()
 
 # --------------------------------------------------
-# Source list (headers included for clarity)
+# Source list
 # --------------------------------------------------
 set(SOURCES
     src/main.cpp
@@ -29,6 +29,9 @@ set(SOURCES
     src/core/Geometry.hpp
     src/core/Scene.hpp
     src/core/Light.hpp
+
+    src/platform/Win32Window.hpp
+    src/platform/Win32Window.cpp
 )
 
 add_executable(NoPkgRen ${SOURCES})
@@ -36,3 +39,10 @@ add_executable(NoPkgRen ${SOURCES})
 target_include_directories(NoPkgRen PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
+
+# --------------------------------------------------
+# Link against Win32 libraries on Windows
+# --------------------------------------------------
+if (WIN32)
+    target_link_libraries(NoPkgRen PRIVATE user32 gdi32)
+endif()
