@@ -15,87 +15,151 @@ static double clamp01(double x) {
     return x;
 }
 
-// Trace a single ray into the scene and return its color.
-Vec3 traceRay(const Ray& ray, const Scene& scene, const Vec3& camPos) {
-    double closestDist = std::numeric_limits<double>::infinity();
-    Vec3 finalColor(0.0, 0.0, 0.0);
-    bool hitSomething = false;
+// ----------------------------------------------------------
+// Shadow test
+// ----------------------------------------------------------
+//
+// Cast a ray from the hit point towards the light.
+// If we hit ANY triangle before reaching the light, the point
+// is in shadow.
+//
+// We offset the ray origin slightly along the light direction
+// to avoid "self-intersection" (shadow acne).
+//
+bool isInShadow(const Vec3& point, const Scene& scene, const Triangle* selfTri) {
+    // Vector from hit point to light
+    Vec3 toLight = scene.light.position - point;
+    double distToLight = toLight.length();
+    if (distToLight <= 0.0) {
+        return false;
+    }
 
+    Vec3 dirToLight = toLight / distToLight;   // normalized
+
+    // Small epsilon to avoid self-intersection due to floating point error
+    const double EPS = 1e-4;
+    Vec3 origin = point + dirToLight * EPS;
+
+    Ray shadowRay(origin, dirToLight);
+
+    // Test against all triangles
     for (const Triangle& tri : scene.triangles) {
-        // 1) Compute the plane of this triangle
-        Plane p = computePlane(tri);
+        // Optional: skip the triangle that we are already on
+        if (&tri == selfTri) continue;
 
-        // 2) Intersect ray with the plane
         double lambda = 0.0;
-        if (!intersectPlane(ray, p, lambda)) {
-            continue; // No intersection with plane
-        }
-
-        // 3) Get intersection point
-        Vec3 hit = ray.at(lambda);
-
-        // 4) Check if intersection is inside the triangle
-        if (!pointInTriangle(hit, tri)) {
+        if (!intersectTriangle(shadowRay, tri, lambda)) {
             continue;
         }
 
-        // 5) Compute distance from camera to hit point
-        double dist = (hit - camPos).length();
-
-        // If this hit is closer than anything we've seen before, shade it
-        if (dist < closestDist) {
-            closestDist = dist;
-            hitSomething = true;
-
-            // --- Lambert shading ---
-
-            // Normal of triangle (constant across surface)
-            Vec3 N = computeTriangleNormal(tri);
-
-            // Direction from hit point to light
-            Vec3 L = (scene.light.position - hit).normalized();
-
-            // Basic Lambert term
-            double lambert = dot(N, L);
-            if (lambert < 0.0) lambert = 0.0;
-
-            // Distance-based attenuation (soft)
-            double attenuation = 1.0 / (1.0 + 0.15 * dist * dist);
-
-            // Combine:
-            // finalColor = triangleColor * lightColor * lambert * intensity * attenuation
-            Vec3 baseColor = tri.color;
-            Vec3 lightCol = scene.light.color;
-
-            finalColor =
-                baseColor *
-                (lambert * scene.light.intensity * attenuation) *
-                lightCol.x;  // since lightCol is usually (1,1,1), we can just scale by x
-
-            // If you want proper RGB light, use:
-            // finalColor = Vec3(
-            //     baseColor.x * lightCol.x * lambert * scene.light.intensity * attenuation,
-            //     baseColor.y * lightCol.y * lambert * scene.light.intensity * attenuation,
-            //     baseColor.z * lightCol.z * lambert * scene.light.intensity * attenuation
-            // );
+        // If the hit is between the point and the light, we are in shadow
+        if (lambda > 0.0 && lambda < distToLight) {
+            return true;
         }
     }
 
+    return false;
+}
+
+// ----------------------------------------------------------
+// Ray tracer: trace a single ray and return color
+// ----------------------------------------------------------
+//
+// This now supports:
+//   * Closest-hit triangle
+//   * Lambert lighting (N·L)
+//   * Distance attenuation
+//   * Hard shadows (shadow rays)
+//   * Ambient term
+//
+Vec3 traceRay(const Ray& ray, const Scene& scene, const Vec3& camPos) {
+    double closestDist = std::numeric_limits<double>::infinity();
+    Vec3 hitColor(0.0, 0.0, 0.0);
+    bool hitSomething = false;
+    const Triangle* hitTriPtr = nullptr;
+    Vec3 hitPoint;
+
+    // ------------------------------------------------------
+    // Find closest intersection
+    // ------------------------------------------------------
+    for (const Triangle& tri : scene.triangles) {
+        double lambda = 0.0;
+        Vec3 localHit;
+
+        if (!intersectTriangle(ray, tri, lambda, &localHit)) {
+            continue;
+        }
+
+        double dist = (localHit - camPos).length();
+
+        if (dist < closestDist) {
+            closestDist = dist;
+            hitSomething = true;
+            hitTriPtr = &tri;
+            hitPoint = localHit;
+        }
+    }
+
+    // If we didn't hit anything, draw background sky gradient
     if (!hitSomething) {
-        // Background: simple gradient based on ray direction (optional)
         Vec3 d = ray.direction.normalized();
         double t = 0.5 * (d.y + 1.0); // map y from [-1,1] to [0,1]
         Vec3 skyTop(0.2, 0.4, 0.8);   // bluish
         Vec3 skyBottom(0.0, 0.0, 0.0); // black
-        finalColor = (1.0 - t) * skyBottom + t * skyTop;
+        Vec3 skyColor = (1.0 - t) * skyBottom + t * skyTop;
+        skyColor.x = clamp01(skyColor.x);
+        skyColor.y = clamp01(skyColor.y);
+        skyColor.z = clamp01(skyColor.z);
+        return skyColor;
     }
 
-    // Clamp to [0,1]
-    finalColor.x = clamp01(finalColor.x);
-    finalColor.y = clamp01(finalColor.y);
-    finalColor.z = clamp01(finalColor.z);
+    // ------------------------------------------------------
+    // We have a hit: compute shading
+    // ------------------------------------------------------
+    const Triangle& hitTri = *hitTriPtr;
 
-    return finalColor;
+    // Base values
+    Vec3 baseColor = hitTri.color;
+    Vec3 lightColor = scene.light.color;
+
+    // Normal at triangle (flat shaded)
+    Vec3 N = computeTriangleNormal(hitTri);
+
+    // Direction to light
+    Vec3 L = (scene.light.position - hitPoint).normalized();
+
+    // Lambert term
+    double lambert = dot(N, L);
+    if (lambert < 0.0) lambert = 0.0;
+
+    // Distance attenuation (same as before)
+    double dist = closestDist;
+    double attenuation = 1.0 / (1.0 + 0.15 * dist * dist);
+
+    // Ambient term (always on a little bit, so shadows are not pure black)
+    const double ambient = 0.15;
+
+    // Shadow check: if in shadow, we remove the direct light
+    bool shadow = isInShadow(hitPoint, scene, hitTriPtr);
+
+    double lightFactor = ambient;
+    if (!shadow) {
+        lightFactor += lambert * scene.light.intensity * attenuation;
+    }
+
+    // Combine base color and light
+    hitColor = Vec3(
+        baseColor.x * lightColor.x * lightFactor,
+        baseColor.y * lightColor.y * lightFactor,
+        baseColor.z * lightColor.z * lightFactor
+    );
+
+    // Clamp to [0,1]
+    hitColor.x = clamp01(hitColor.x);
+    hitColor.y = clamp01(hitColor.y);
+    hitColor.z = clamp01(hitColor.z);
+
+    return hitColor;
 }
 
 int main() {
@@ -127,11 +191,6 @@ int main() {
     );
 
     // Create a pyramid
-    //
-    // Coordinates are chosen so that:
-    // - top is higher (Y)
-    // - base is a square-ish shape in front of camera
-    //
     Vec3 top(0.0, 1.5, 3.5);
     Vec3 bl(-1.0, 0.0, 4.5);
     Vec3 br(1.0, 0.0, 4.5);
@@ -159,7 +218,7 @@ int main() {
     // --------------------------------------------------
     // Open output file
     // --------------------------------------------------
-    std::ofstream out("render_color.ppm");
+    std::ofstream out("render_shadow.ppm");
     if (!out) {
         std::cerr << "Failed to open output file.\n";
         return 1;
@@ -176,7 +235,7 @@ int main() {
             // Generate camera ray for this pixel
             Ray ray = cam.generateRay(x, y);
 
-            // Trace ray into scene
+            // Trace ray into scene (with shadows)
             Vec3 color = traceRay(ray, scene, cam.position);
 
             // Convert [0,1] to [0,255]
@@ -189,7 +248,7 @@ int main() {
     }
 
     out.close();
-    std::cout << "Rendered color image to render_color.ppm\n";
+    std::cout << "Rendered shadowed image to render_shadow.ppm\n";
 
     return 0;
 }
