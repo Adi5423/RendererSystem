@@ -53,11 +53,17 @@ bool Win32Window::create(const char* title, int width, int height) {
         return false;
     }
 
-    DWORD style = WS_OVERLAPPEDWINDOW;
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
 
-    RECT rect{ 0, 0, width, height };
+    // Force a 4:3 client area
+    int clientW = width;
+    int clientH = height;
+
+    // Compute full window size for a client area of clientW x clientH
+    RECT rect{ 0, 0, clientW, clientH };
     AdjustWindowRect(&rect, style, FALSE);
 
+    // Create non-resizable 4:3 window
     m_hwnd = CreateWindowExA(
         0,
         wc.lpszClassName,
@@ -71,6 +77,7 @@ bool Win32Window::create(const char* title, int width, int height) {
         m_hInstance,
         nullptr
     );
+
 
     if (!m_hwnd) {
         return false;
@@ -108,9 +115,14 @@ void Win32Window::initBitmapInfo(int srcWidth, int srcHeight) {
 void Win32Window::present(const std::uint32_t* pixels, int srcWidth, int srcHeight) {
     if (!m_hwnd || !pixels) return;
 
-    if (!m_bmiInitialized) {
+    // If source resolution changed, rebuild bitmap info
+    if (!m_bmiInitialized ||
+        m_bmi.bmiHeader.biWidth != srcWidth ||
+        m_bmi.bmiHeader.biHeight != -srcHeight)     // negative height = top-down
+    {
         initBitmapInfo(srcWidth, srcHeight);
     }
+
 
     RECT clientRect;
     GetClientRect(m_hwnd, &clientRect);
