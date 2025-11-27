@@ -1,0 +1,6 @@
+build
+.vs
+.git
+out
+.vscode
+node_modules
