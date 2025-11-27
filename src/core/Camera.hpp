@@ -68,20 +68,32 @@ struct Camera {
         );
     }
 
-    // Generate a ray for pixel (px, py) in [0, imageWidth/Height)
+    // ----------------------------
+    // Default: center-of-pixel ray
+    // ----------------------------
     Ray generateRay(int px, int py) const {
-        // Convert pixel coords to [0,1] then to [-0.5, +0.5] in view plane
-        double u = (static_cast<double>(px) + 0.5) / static_cast<double>(imageWidth);
-        double v = (static_cast<double>(py) + 0.5) / static_cast<double>(imageHeight);
+        return generateRayJittered(px, py, 0.0, 0.0);
+    }
+
+    // ------------------------------------------------------
+    // Jittered ray: sub-pixel sampling
+    //
+    // px, py: integer pixel indices
+    // jx, jy: jitter in range [-0.5, 0.5] for anti-aliasing
+    //
+    // Effective sample position:
+    //   (px + 0.5 + jx, py + 0.5 + jy)
+    // ------------------------------------------------------
+    Ray generateRayJittered(int px, int py, double jx, double jy) const {
+        double u = (static_cast<double>(px) + 0.5 + jx) / static_cast<double>(imageWidth);
+        double v = (static_cast<double>(py) + 0.5 + jy) / static_cast<double>(imageHeight);
 
         double x = (u - 0.5) * viewPlaneWidth;
         double y = (v - 0.5) * viewPlaneHeight;
         double z = viewPlaneDist;  // forward
 
-        // Base direction before rotation
         Vec3 dir(x, -y, z); // -y so that top of image is positive up
 
-        // Apply yaw then pitch
         dir = rotateY(dir, yaw);
         dir = rotateX(dir, pitch);
 

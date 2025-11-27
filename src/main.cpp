@@ -1,11 +1,13 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <algorithm> // For std::min
 
 #include <cstdint>
 #include <iostream>
 #include <limits>
 #include <vector>
-#include <cmath>
+#include <thread>
+
 
 #include "math/Vec3.hpp"
 #include "core/Ray.hpp"
@@ -14,7 +16,9 @@
 #include "core/Geometry.hpp"
 #include "platform/Win32Window.hpp"
 
-// Clamp a value to [0,1]
+// ----------------------------------------------------------
+// Utility: clamp [0,1]
+// ----------------------------------------------------------
 static double clamp01(double x) {
     if (x < 0.0) return 0.0;
     if (x > 1.0) return 1.0;
@@ -22,13 +26,21 @@ static double clamp01(double x) {
 }
 
 // ----------------------------------------------------------
+// Simple per-thread RNG (xorshift32)
+// ----------------------------------------------------------
+inline double rand01(std::uint32_t& state) {
+    // xorshift32
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    // Keep only lower 24 bits for fraction
+    std::uint32_t v = state & 0xFFFFFFu;
+    return static_cast<double>(v) / static_cast<double>(0x1000000u); // [0,1)
+}
+
+// ----------------------------------------------------------
 // Shadow test
 // ----------------------------------------------------------
-//
-// Cast a ray from the hit point towards the light.
-// If we hit ANY triangle before reaching the light, the point
-// is in shadow.
-//
 bool isInShadow(const Vec3& point, const Scene& scene, const Triangle* selfTri) {
     Vec3 toLight = scene.light.position - point;
     double distToLight = toLight.length();
@@ -137,16 +149,15 @@ Vec3 traceRay(const Ray& ray, const Scene& scene, const Vec3& camPos) {
 }
 
 // ----------------------------------------------------------
-// Render whole scene into a framebuffer (0x00BBGGRR pixels)
+// Render low-res scene into framebuffer (0x00BBGGRR pixels)
 // ----------------------------------------------------------
-void renderSceneToBuffer(
+void renderLowRes(
     int width,
     int height,
     Camera& cam,
     const Scene& scene,
     std::uint32_t* framebuffer)
 {
-    // Make sure camera knows about current image size
     cam.setImageSize(width, height);
 
     for (int y = 0; y < height; ++y) {
@@ -162,7 +173,6 @@ void renderSceneToBuffer(
             if (ig < 0) ig = 0; if (ig > 255) ig = 255;
             if (ib < 0) ib = 0; if (ib > 255) ib = 255;
 
-            // Convert to 0x00BBGGRR for Win32 DIB
             std::uint32_t pixel =
                 (static_cast<std::uint32_t>(ib)) |
                 (static_cast<std::uint32_t>(ig) << 8) |
@@ -174,16 +184,97 @@ void renderSceneToBuffer(
 }
 
 // ----------------------------------------------------------
-// Update camera based on keyboard input
+// Progressive high-res sample (multi-threaded)
 // ----------------------------------------------------------
 //
-// Controls:
-//   W/S: move forward/back
-//   A/D: strafe left/right
-//   Q/E: move down/up
-//   Arrow Left/Right: yaw
-//   Arrow Up/Down:    pitch
+// Each call adds ONE new sample per pixel and updates:
+//   - fbAccum : floating-point accumulated color
+//   - framebuffer : 8-bit display buffer (0x00BBGGRR)
 //
+// sampleIndex = current number of samples already accumulated.
+// New sample is folded like:
+//   newAcc = (oldAcc * sampleIndex + sampleColor) / (sampleIndex + 1)
+// ----------------------------------------------------------
+void renderHighResSample(
+    int width,
+    int height,
+    Camera& cam,
+    const Scene& scene,
+    std::vector<Vec3>& fbAccum,
+    std::uint32_t* framebuffer,
+    int sampleIndex)
+{
+    cam.setImageSize(width, height);
+
+    // ---------------------------------------
+    // MSVC-safe hardware concurrency fetch
+    // ---------------------------------------
+    unsigned int nt = std::thread::hardware_concurrency();
+    int numThreads = nt > 0 ? (int)nt : 1;
+
+    std::vector<std::thread> threads;
+    threads.reserve(numThreads);
+
+    int blockHeight = (height + numThreads - 1) / numThreads;
+
+    for (int t = 0; t < numThreads; ++t) {
+        int startY = t * blockHeight;
+        int endY = (std::min)(height, startY + blockHeight);
+        if (startY >= endY) break;
+
+        // Per-thread RNG seed
+        std::uint32_t seed = (std::uint32_t)GetTickCount64() ^ (t * 0x9E3779B1u);
+
+        // ---------------------------------------
+        // MSVC-friendly lambda:
+        // capture all by reference [&]
+        // copy needed small variables explicitly
+        // ---------------------------------------
+        threads.emplace_back(
+            [&, sampleIndex, startY, endY, width, height, seed]() mutable
+            {
+                for (int y = startY; y < endY; ++y) {
+                    for (int x = 0; x < width; ++x) {
+
+                        // Sub-pixel jitter
+                        double jx = rand01(seed) - 0.5;
+                        double jy = rand01(seed) - 0.5;
+
+                        Ray ray = cam.generateRayJittered(x, y, jx, jy);
+                        Vec3 color = traceRay(ray, scene, cam.position);
+
+                        int idx = y * width + x;
+
+                        // Progressive accumulation
+                        Vec3 oldAcc = fbAccum[idx];
+                        double s = (double)sampleIndex;
+                        Vec3 newAcc = (oldAcc * s + color) / (s + 1.0);
+                        fbAccum[idx] = newAcc;
+
+                        // Convert to 8-bit
+                        int ir = (int)(255.99 * clamp01(newAcc.x));
+                        int ig = (int)(255.99 * clamp01(newAcc.y));
+                        int ib = (int)(255.99 * clamp01(newAcc.z));
+
+                        if (ir < 0) ir = 0; if (ir > 255) ir = 255;
+                        if (ig < 0) ig = 0; if (ig > 255) ig = 255;
+                        if (ib < 0) ib = 0; if (ib > 255) ib = 255;
+
+                        framebuffer[idx] =
+                            (uint32_t)ib |
+                            ((uint32_t)ig << 8) |
+                            ((uint32_t)ir << 16);
+                    }
+                }
+            });
+    }
+
+    for (auto& th : threads) th.join();
+}
+
+// ----------------------------------------------------------
+// Update camera based on keyboard input
+// ----------------------------------------------------------
 void updateCamera(Camera& cam, double dt) {
     const double moveSpeed = 2.5;      // units per second
     const double rotSpeed = 1.5;      // radians per second
@@ -234,7 +325,7 @@ void updateCamera(Camera& cam, double dt) {
         cam.pitch -= rotStep;
     }
 
-    // Clamp pitch to avoid flipping upside-down
+    // Clamp pitch
     const double maxPitch = 1.5; // ~86 degrees
     if (cam.pitch > maxPitch) cam.pitch = maxPitch;
     if (cam.pitch < -maxPitch) cam.pitch = -maxPitch;
@@ -244,11 +335,13 @@ void updateCamera(Camera& cam, double dt) {
 // Entry point
 // ----------------------------------------------------------
 int main() {
-    // Hybrid resolutions
     const int LOW_W = 200;
     const int LOW_H = 150;
     const int HIGH_W = 400;
     const int HIGH_H = 300;
+
+    const double targetFPS = 60.0;
+    const double targetDelta = 1.0 / targetFPS;
 
     // --------------------------------------------------
     // Create window
@@ -264,44 +357,38 @@ int main() {
     // --------------------------------------------------
     Scene scene;
 
-    // Light above and to the right of the scene
     scene.light = Light(
-        Vec3(2.0, 5.0, -2.0),   // position
-        Vec3(1.0, 1.0, 1.0),    // color
-        3.0                     // intensity
+        Vec3(2.0, 5.0, -2.0),
+        Vec3(1.0, 1.0, 1.0),
+        3.0
     );
 
-    // Pyramid
     Vec3 top(0.0, 1.5, 3.5);
     Vec3 bl(-1.0, 0.0, 4.5);
     Vec3 br(1.0, 0.0, 4.5);
     Vec3 br2(1.0, 0.0, 2.5);
     Vec3 bl2(-1.0, 0.0, 2.5);
 
-    Vec3 baseColor1(0.8, 0.2, 0.2); // reddish
-    Vec3 baseColor2(0.8, 0.8, 0.2); // yellowish
-    Vec3 sideColor1(0.2, 0.8, 0.2); // greenish
-    Vec3 sideColor2(0.2, 0.8, 0.8); // cyan
-    Vec3 sideColor3(0.2, 0.2, 0.8); // blue
-    Vec3 sideColor4(0.8, 0.2, 0.8); // magenta
+    Vec3 baseColor1(0.8, 0.2, 0.2);
+    Vec3 baseColor2(0.8, 0.8, 0.2);
+    Vec3 sideColor1(0.2, 0.8, 0.2);
+    Vec3 sideColor2(0.2, 0.8, 0.8);
+    Vec3 sideColor3(0.2, 0.2, 0.8);
+    Vec3 sideColor4(0.8, 0.2, 0.8);
 
-    // Base (square split into 2 triangles)
     scene.addTriangle(Triangle(bl, br, br2, baseColor1));
     scene.addTriangle(Triangle(bl, br2, bl2, baseColor2));
-
-    // Sides
     scene.addTriangle(Triangle(top, bl, br, sideColor1));
     scene.addTriangle(Triangle(top, br, br2, sideColor2));
     scene.addTriangle(Triangle(top, br2, bl2, sideColor3));
     scene.addTriangle(Triangle(top, bl2, bl, sideColor4));
 
-    // Ground plane (big quad as two triangles)
+    // Ground
     Vec3 g1(-5.0, -0.001, 8.0);
     Vec3 g2(5.0, -0.001, 8.0);
     Vec3 g3(5.0, -0.001, 0.0);
     Vec3 g4(-5.0, -0.001, 0.0);
     Vec3 groundColor(0.4, 0.4, 0.4);
-
     scene.addTriangle(Triangle(g1, g2, g3, groundColor));
     scene.addTriangle(Triangle(g1, g3, g4, groundColor));
 
@@ -309,78 +396,101 @@ int main() {
     // Camera
     // --------------------------------------------------
     Camera cam(
-        Vec3(0.0, 1.0, -4.0),  // position
-        0.0,                   // yaw
-        0.0,                   // pitch
-        LOW_W, LOW_H,          // start with low-res
-        1.0,                   // viewplane dist
-        1.2                    // viewplane width
+        Vec3(0.0, 1.0, -4.0),
+        0.0,
+        0.0,
+        LOW_W, LOW_H,
+        1.0,
+        1.2
     );
 
     // --------------------------------------------------
-    // Framebuffers for low and high res
+    // Framebuffers
     // --------------------------------------------------
     std::vector<std::uint32_t> fbLow(LOW_W * LOW_H);
     std::vector<std::uint32_t> fbHigh(HIGH_W * HIGH_H);
+    std::vector<Vec3>          fbHighAccum(HIGH_W * HIGH_H, Vec3(0.0, 0.0, 0.0));
 
     // --------------------------------------------------
-    // Timing setup
+    // Timing
     // --------------------------------------------------
     LARGE_INTEGER freq;
-    LARGE_INTEGER prevCounter;
     QueryPerformanceFrequency(&freq);
+
+    LARGE_INTEGER prevCounter;
     QueryPerformanceCounter(&prevCounter);
 
     bool running = true;
-    bool highResRequested = false;
+    bool highResMode = false;
+    int  highResSamples = 0;
+    bool rLastDown = false;
 
     std::cout << "Controls:\n"
         << "  W/S: move forward/back\n"
         << "  A/D: strafe left/right\n"
         << "  Q/E: move down/up\n"
         << "  Arrow Keys: rotate camera\n"
-        << "  R: render high-res frame\n"
-        << "  Close window to exit\n";
+        << "  Hold R: progressive high-res render\n"
+        << "  Release R: back to low-res interactive\n";
 
-    // --------------------------------------------------
-    // Main loop
-    // --------------------------------------------------
     while (running) {
-        // Handle OS messages
+        LARGE_INTEGER frameStart;
+        QueryPerformanceCounter(&frameStart);
+
         if (!window.processMessages()) {
             running = false;
             break;
         }
 
-        // Compute delta time
-        LARGE_INTEGER curCounter;
-        QueryPerformanceCounter(&curCounter);
-        double dt = static_cast<double>(curCounter.QuadPart - prevCounter.QuadPart)
+        double dt = static_cast<double>(frameStart.QuadPart - prevCounter.QuadPart)
             / static_cast<double>(freq.QuadPart);
-        prevCounter = curCounter;
+        prevCounter = frameStart;
+        if (dt > 0.1) dt = 0.1;
 
-        // Update camera from input
-        updateCamera(cam, dt);
-
-        // Check for high-res request (R key)
-        if (GetAsyncKeyState('R') & 0x8000) {
-            highResRequested = true;
+        // Camera update only in low-res mode (you can change this if you want camera
+        // to move while high-res is refining, but that will blur the final image).
+        if (!highResMode) {
+            updateCamera(cam, dt);
         }
 
-        if (highResRequested) {
-            // Render a high-res frame (blocking)
-            renderSceneToBuffer(HIGH_W, HIGH_H, cam, scene, fbHigh.data());
+        // R key: hold for high-res progressive
+        bool rDown = (GetAsyncKeyState('R') & 0x8000) != 0;
+        if (rDown && !rLastDown) {
+            // R pressed: start high-res mode
+            highResMode = true;
+            highResSamples = 0;
+            std::fill(fbHighAccum.begin(), fbHighAccum.end(), Vec3(0.0, 0.0, 0.0));
+        }
+        if (!rDown && rLastDown) {
+            // R released: stop high-res mode
+            highResMode = false;
+        }
+        rLastDown = rDown;
+
+        if (highResMode) {
+            // Add one sample per pixel each frame (multi-threaded)
+            renderHighResSample(HIGH_W, HIGH_H, cam, scene, fbHighAccum, fbHigh.data(), highResSamples);
+            highResSamples++;
             window.present(fbHigh.data(), HIGH_W, HIGH_H);
-            highResRequested = false;
         }
         else {
-            // Render low-res interactive frame
-            renderSceneToBuffer(LOW_W, LOW_H, cam, scene, fbLow.data());
+            // Low-res interactive
+            renderLowRes(LOW_W, LOW_H, cam, scene, fbLow.data());
             window.present(fbLow.data(), LOW_W, LOW_H);
         }
 
-        // Small sleep to avoid maxing out CPU (optional)
-        Sleep(1);
+        LARGE_INTEGER frameEnd;
+        QueryPerformanceCounter(&frameEnd);
+
+        double frameTime = static_cast<double>(frameEnd.QuadPart - frameStart.QuadPart)
+            / static_cast<double>(freq.QuadPart);
+        double remaining = targetDelta - frameTime;
+        if (remaining > 0.0) {
+            DWORD sleepMs = static_cast<DWORD>(remaining * 1000.0);
+            if (sleepMs > 0) {
+                Sleep(sleepMs);
+            }
+        }
     }
 
     return 0;
