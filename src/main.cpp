@@ -1,60 +1,91 @@
 #include <fstream>
 #include <iostream>
-#include <string>
+#include <limits>
 
-#include "math/Vec3.hpp"
 #include "core/Camera.hpp"
-#include "core/Ray.hpp"
+#include "core/Scene.hpp"
+#include "core/Geometry.hpp"
 
 int main() {
-    const int imageWidth = 400;
-    const int imageHeight = 300;
+    const int W = 400;
+    const int H = 300;
 
-    // Camera at origin, looking straight along +Z
     Camera cam(
-        Vec3(0.0, 0.0, 0.0),  // position
-        0.6,                  // yaw in radians
-        0.3,                  // pitch in radians
-        imageWidth,
-        imageHeight,
-        1.0,                  // view plane distance
-        0.5                   // view plane width
+        Vec3(0, 0, -3),   // camera pulled back a bit
+        0.0,              // yaw
+        0.0,              // pitch
+        W, H,
+        1.0,              // viewplane dist
+        1.0               // width
     );
 
-    // Output file
-    const std::string filename = "output.ppm";
-    std::ofstream out(filename);
+    Scene scene;
 
-    if (!out) {
-        std::cerr << "Failed to open output file: " << filename << "\n";
-        return 1;
-    }
+    // --------------------------
+    // Create a pyramid (4 triangles)
+    // --------------------------
 
-    // PPM header (plain P3)
-    out << "P3\n" << imageWidth << " " << imageHeight << "\n255\n";
+    Vec3 top(0, 1, 3);
+    Vec3 bl(-1, -1, 4);
+    Vec3 br(1, -1, 4);
+    Vec3 br2(1, -1, 2);
+    Vec3 bl2(-1, -1, 2);
 
-    // For each pixel, generate a ray and color it based on its direction (for testing)
-    for (int y = 0; y < imageHeight; ++y) {
-        for (int x = 0; x < imageWidth; ++x) {
-            Ray r = cam.generateRay(x, y);
+    // Pyramid base is a square split into 2 triangles
+    scene.addTriangle(Triangle(bl, br, br2));
+    scene.addTriangle(Triangle(bl, br2, bl2));
 
-            // Map direction to color just for debugging:
-            // dir in [-1,1] -> color in [0,1]
-            Vec3 d = r.direction;
-            double rCol = 0.5 * (d.x + 1.0);
-            double gCol = 0.5 * (d.y + 1.0);
-            double bCol = 0.5 * (d.z + 1.0);
+    // 3 sides
+    scene.addTriangle(Triangle(top, bl, br));
+    scene.addTriangle(Triangle(top, br, br2));
+    scene.addTriangle(Triangle(top, br2, bl2));
+    scene.addTriangle(Triangle(top, bl2, bl));
 
-            int ir = static_cast<int>(255.99 * rCol);
-            int ig = static_cast<int>(255.99 * gCol);
-            int ib = static_cast<int>(255.99 * bCol);
+    // --------------------------
+    // Prepare output
+    // --------------------------
+    std::ofstream out("render.ppm");
+    out << "P3\n" << W << " " << H << "\n255\n";
 
-            out << ir << " " << ig << " " << ib << "\n";
+    // --------------------------
+    // Render loop
+    // --------------------------
+
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+
+            Ray ray = cam.generateRay(x, y);
+
+            double closestDist = std::numeric_limits<double>::infinity();
+            double brightness = 0.0;
+
+            // test against all triangles
+            for (const Triangle& t : scene.triangles) {
+                Plane p = computePlane(t);
+
+                double lambda;
+                if (!intersectPlane(ray, p, lambda))
+                    continue;
+
+                Vec3 hit = ray.at(lambda);
+
+                if (!pointInTriangle(hit, t))
+                    continue;
+
+                double dist = (hit - cam.position).length();
+                if (dist < closestDist) {
+                    closestDist = dist;
+                    brightness = 1.0 / dist;
+                }
+            }
+
+            int col = static_cast<int>(255.99 * brightness);
+            if (col > 255) col = 255;
+
+            out << col << " " << col << " " << col << "\n";
         }
     }
 
     out.close();
-    std::cout << "Wrote test image to " << filename << "\n";
-
-    return 0;
+    std::cout << "Render saved to render.ppm\n";
 }
